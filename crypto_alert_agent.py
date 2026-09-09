@@ -63,7 +63,7 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "PUT_YOUR_BOT_TOKEN_HE
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "PUT_YOUR_CHAT_ID_HERE")
 
 TOP_N_COINS = 20                 # how many top-market-cap coins to watch
-MOVE_THRESHOLD_PERCENT = 10.0    # alert when 24h change exceeds this (absolute value)
+MOVE_THRESHOLD_PERCENT = 0.5    # alert when 24h change exceeds this (absolute value)
 CHECK_INTERVAL_MINUTES = 5       # how often to poll CoinGecko
 COOLDOWN_MINUTES = 60            # don't re-alert on the same coin/direction within this window
 VS_CURRENCY = "usd"
