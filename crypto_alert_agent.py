@@ -6,14 +6,16 @@ Watches the top N cryptocurrencies by market cap and sends Telegram alerts on:
   - 1h / 24h / 7d price moves past configurable thresholds
   - Volume spikes (current volume vs recent trailing average)
   - Fast moves within a short rolling window (default 5 min), detected via a
-    live Binance WebSocket feed, so you don't have to wait for the next poll
+    live Coinbase WebSocket feed, so you don't have to wait for the next poll
 
 Data sources:
   - CoinMarketCap (if CMC_API_KEY is set) - richer data, one call gives
     1h/24h/7d % change and volume together.
   - CoinGecko (automatic fallback, no key needed) - used if no CMC key is set.
-  - Binance public WebSocket - real-time price ticks for the fast-move layer.
-    No key needed, this is Binance's public market data stream.
+  - Coinbase public WebSocket - real-time price ticks for the fast-move layer.
+    No key needed, this is Coinbase's public market data stream. (Binance's
+    equivalent feed blocks connections from US-based servers, which is where
+    most free hosts like Railway run, so Coinbase is used instead.)
 
 SETUP
 -----
@@ -96,8 +98,8 @@ NEWS_FEEDS = [
 
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agent_state.json")
 
-BINANCE_EXCHANGE_INFO_URL = "https://api.binance.com/api/v3/exchangeInfo"
-BINANCE_WS_BASE = "wss://stream.binance.com:9443/stream?streams="
+COINBASE_PRODUCTS_URL = "https://api.exchange.coinbase.com/products"
+COINBASE_WS_URL = "wss://ws-feed.exchange.coinbase.com"
 
 # ---------------------------------------------------------------------------
 # LOGGING
@@ -352,19 +354,22 @@ def check_periodic(state, news_items):
 
 
 # ---------------------------------------------------------------------------
-# FAST-MOVE LAYER: live Binance WebSocket
+# FAST-MOVE LAYER: live Coinbase WebSocket
 # ---------------------------------------------------------------------------
+# Uses Coinbase's public "ticker" feed instead of Binance - Binance.com blocks
+# connections from US-based servers (incl. Railway's default region), while
+# Coinbase, being a US exchange, does not.
 
-class BinanceWatcher:
-    """Maintains a live WebSocket connection to Binance for the current set
+class CoinbaseWatcher:
+    """Maintains a live WebSocket connection to Coinbase for the current set
     of watched coins, and raises fast-move alerts within a short rolling
     window, independent of the slower periodic poll."""
 
     def __init__(self, state, news_items_getter):
         self.state = state
         self.news_items_getter = news_items_getter
-        self.price_history = {}   # binance_symbol -> deque[(ts, price)]
-        self.symbol_meta = {}     # binance_symbol -> {"symbol":..., "name":...}
+        self.price_history = {}   # product_id -> deque[(ts, price)]
+        self.symbol_meta = {}     # product_id (e.g. "BTC-USD") -> {"symbol":..., "name":...}
         self._valid_pairs = None
         self._ws = None
         self._ws_thread = None
@@ -373,12 +378,19 @@ class BinanceWatcher:
 
     def _fetch_valid_pairs(self):
         try:
-            resp = requests.get(BINANCE_EXCHANGE_INFO_URL, timeout=15)
+            resp = requests.get(
+                COINBASE_PRODUCTS_URL,
+                headers={"User-Agent": "crypto-alert-agent"},
+                timeout=15,
+            )
             resp.raise_for_status()
             data = resp.json()
-            return {s["symbol"].lower() for s in data["symbols"] if s["status"] == "TRADING"}
+            return {
+                p["id"] for p in data
+                if p.get("quote_currency") == "USD" and not p.get("trading_disabled")
+            }
         except requests.RequestException as e:
-            log.warning(f"Could not fetch Binance exchange info: {e}")
+            log.warning(f"Could not fetch Coinbase products: {e}")
             return set()
 
     def update_watchlist(self, coins):
@@ -392,9 +404,9 @@ class BinanceWatcher:
             symbol = c["symbol"]
             if symbol in STABLECOIN_SYMBOLS:
                 continue
-            pair = f"{symbol}usdt"
-            if pair in self._valid_pairs:
-                new_meta[pair] = {"symbol": symbol, "name": c["name"]}
+            product_id = f"{symbol.upper()}-USD"
+            if product_id in self._valid_pairs:
+                new_meta[product_id] = {"symbol": symbol, "name": c["name"]}
 
         with self._lock:
             changed = set(new_meta.keys()) != set(self.symbol_meta.keys())
@@ -416,6 +428,21 @@ class BinanceWatcher:
             self._ws_thread = threading.Thread(target=self._run_forever, daemon=True)
             self._ws_thread.start()
 
+    def _on_open(self, ws):
+        with self._lock:
+            product_ids = list(self.symbol_meta.keys())
+        if not product_ids:
+            return
+        sub_msg = {
+            "type": "subscribe",
+            "product_ids": product_ids,
+            "channels": ["ticker"],
+        }
+        try:
+            ws.send(json.dumps(sub_msg))
+        except Exception as e:
+            log.warning(f"Coinbase WS subscribe failed: {e}")
+
     def _run_forever(self):
         if websocket is None:
             log.warning("websocket-client not installed; skipping fast-move layer. "
@@ -423,30 +450,30 @@ class BinanceWatcher:
             return
         while not self._stop:
             with self._lock:
-                pairs = list(self.symbol_meta.keys())
-            if not pairs:
+                has_pairs = bool(self.symbol_meta)
+            if not has_pairs:
                 time.sleep(5)
                 continue
-            streams = "/".join(f"{p}@miniTicker" for p in pairs)
-            url = BINANCE_WS_BASE + streams
             try:
                 self._ws = websocket.WebSocketApp(
-                    url,
+                    COINBASE_WS_URL,
+                    on_open=self._on_open,
                     on_message=self._on_message,
-                    on_error=lambda ws, err: log.warning(f"Binance WS error: {err}"),
+                    on_error=lambda ws, err: log.warning(f"Coinbase WS error: {err}"),
                 )
                 self._ws.run_forever(ping_interval=30, ping_timeout=10)
             except Exception as e:
-                log.warning(f"Binance WS connection failed: {e}")
+                log.warning(f"Coinbase WS connection failed: {e}")
             if not self._stop:
                 time.sleep(5)  # brief backoff before reconnecting
 
     def _on_message(self, ws, message):
         try:
-            payload = json.loads(message)
-            data = payload.get("data", {})
-            pair = data.get("s", "").lower()
-            price = float(data.get("c", 0))
+            data = json.loads(message)
+            if data.get("type") != "ticker":
+                return
+            pair = data.get("product_id", "")
+            price = float(data.get("price", 0))
         except (ValueError, TypeError, json.JSONDecodeError):
             return
         if not pair or price <= 0:
@@ -524,7 +551,7 @@ def main():
             cached_news["ts"] = time.time()
         return cached_news["items"]
 
-    watcher = BinanceWatcher(state, get_news)
+    watcher = CoinbaseWatcher(state, get_news)
 
     while True:
         try:
