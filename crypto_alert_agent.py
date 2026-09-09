@@ -1,44 +1,37 @@
 #!/usr/bin/env python3
 """
-Crypto Movement Alert Agent
-============================
-Watches the top N cryptocurrencies by market cap (via CoinGecko's public API),
-detects when a coin's price moves more than a configurable threshold (default 10%)
-within a given window, pulls related recent news headlines, and sends a Telegram
-alert.
+Crypto Movement Alert Agent v2
+================================
+Watches the top N cryptocurrencies by market cap and sends Telegram alerts on:
+  - 1h / 24h / 7d price moves past configurable thresholds
+  - Volume spikes (current volume vs recent trailing average)
+  - Fast moves within a short rolling window (default 5 min), detected via a
+    live Binance WebSocket feed, so you don't have to wait for the next poll
 
-Runs as a continuous loop, polling every CHECK_INTERVAL_MINUTES.
+Data sources:
+  - CoinMarketCap (if CMC_API_KEY is set) - richer data, one call gives
+    1h/24h/7d % change and volume together.
+  - CoinGecko (automatic fallback, no key needed) - used if no CMC key is set.
+  - Binance public WebSocket - real-time price ticks for the fast-move layer.
+    No key needed, this is Binance's public market data stream.
 
 SETUP
 -----
 1. Install dependencies:
-       pip install requests feedparser --break-system-packages
+       pip install -r requirements.txt --break-system-packages
 
-2. Create a Telegram bot:
-   - Message @BotFather on Telegram, send /newbot, follow prompts.
-   - Copy the bot token it gives you.
+2. (Recommended, optional) Get a free CoinMarketCap API key:
+   - Sign up at https://coinmarketcap.com/api/ (free "Basic" plan)
+   - Copy your API key from the dashboard
+   - Set it as CMC_API_KEY below or as an environment variable
+   - Without this, the agent automatically uses CoinGecko instead - still
+     works, just slightly less rich data (no built-in volume-change field,
+     which this script computes itself anyway, so functionally similar).
 
-3. Get your chat ID:
-   - Message your new bot anything (e.g. "hi").
-   - Visit: https://api.telegram.org/bot<YOUR_TOKEN>/getUpdates
-   - Find "chat":{"id": ...} in the JSON response - that's your chat ID.
+3. Telegram bot token + chat ID: see README.md (same as v1).
 
-4. Fill in TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID below, or set them as
-   environment variables of the same name.
-
-5. Run:
+4. Run:
        python3 crypto_alert_agent.py
-
-NOTES
------
-- Uses CoinGecko's free public API for price data (no API key required,
-  reasonable rate limits). This is far more reliable than scraping exchange
-  websites, which change their HTML often and frequently block scrapers.
-- News comes from public RSS feeds of major crypto news outlets, matched by
-  coin name/symbol mentions.
-- The agent tracks which coins it has already alerted on for a given move so
-  you don't get spammed every single poll - it only re-alerts if the price
-  moves ANOTHER threshold-sized step beyond the last alert, or after a cooldown.
 """
 
 import os
@@ -46,6 +39,8 @@ import sys
 import time
 import json
 import logging
+import threading
+from collections import deque
 from datetime import datetime, timezone
 
 import requests
@@ -55,22 +50,44 @@ try:
 except ImportError:
     feedparser = None
 
+try:
+    import websocket  # websocket-client package
+except ImportError:
+    websocket = None
+
 # ---------------------------------------------------------------------------
 # CONFIGURATION - edit these, or set as environment variables
 # ---------------------------------------------------------------------------
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "PUT_YOUR_BOT_TOKEN_HERE")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "PUT_YOUR_CHAT_ID_HERE")
+CMC_API_KEY = os.environ.get("CMC_API_KEY", "")  # optional - leave blank to use CoinGecko
 
-TOP_N_COINS = 20                 # how many top-market-cap coins to watch
-MOVE_THRESHOLD_PERCENT = 0.5    # alert when 24h change exceeds this (absolute value)
-CHECK_INTERVAL_MINUTES = 5       # how often to poll CoinGecko
-COOLDOWN_MINUTES = 60            # don't re-alert on the same coin/direction within this window
+TOP_N_COINS = 20
 VS_CURRENCY = "usd"
 
-COINGECKO_MARKETS_URL = "https://api.coingecko.com/api/v3/coins/markets"
+CHECK_INTERVAL_MINUTES = 5       # how often to poll for 1h/24h/7d + volume data
+COOLDOWN_MINUTES = 60            # min gap before re-alerting same coin+timeframe+direction
 
-# RSS feeds used for news matching (add/remove freely)
+# Percent-move thresholds per timeframe (polled data)
+THRESHOLDS = {
+    "1h": 5.0,
+    "24h": 10.0,
+    "7d": 20.0,
+}
+
+# Volume spike: alert if current volume is this many % above the trailing average
+VOLUME_SPIKE_THRESHOLD_PERCENT = 100.0
+VOLUME_HISTORY_SAMPLES = 12      # ~1 hour of history at a 5-min poll interval
+
+# Fast-move layer (WebSocket, near-real-time)
+FAST_MOVE_WINDOW_SECONDS = 300       # 5-minute rolling window
+FAST_MOVE_THRESHOLD_PERCENT = 3.0    # alert if price moves this much within the window
+FAST_MOVE_COOLDOWN_SECONDS = 900     # 15 min between fast-move alerts per coin/direction
+
+# Coins to skip (stablecoins don't meaningfully "move")
+STABLECOIN_SYMBOLS = {"usdt", "usdc", "dai", "tusd", "usde", "fdusd", "busd", "usds", "pyusd"}
+
 NEWS_FEEDS = [
     "https://www.coindesk.com/arc/outboundfeeds/rss/",
     "https://cointelegraph.com/rss",
@@ -78,6 +95,9 @@ NEWS_FEEDS = [
 ]
 
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agent_state.json")
+
+BINANCE_EXCHANGE_INFO_URL = "https://api.binance.com/api/v3/exchangeInfo"
+BINANCE_WS_BASE = "wss://stream.binance.com:9443/stream?streams="
 
 # ---------------------------------------------------------------------------
 # LOGGING
@@ -90,9 +110,10 @@ logging.basicConfig(
 )
 log = logging.getLogger("crypto_agent")
 
+state_lock = threading.Lock()
 
 # ---------------------------------------------------------------------------
-# STATE (persisted across restarts so we don't spam alerts)
+# STATE (persisted so we don't spam alerts across restarts)
 # ---------------------------------------------------------------------------
 
 def load_state():
@@ -107,29 +128,91 @@ def load_state():
 
 def save_state(state):
     try:
-        with open(STATE_FILE, "w") as f:
-            json.dump(state, f, indent=2)
+        with state_lock:
+            with open(STATE_FILE, "w") as f:
+                json.dump(state, f, indent=2)
     except OSError as e:
         log.error(f"Could not save state file: {e}")
 
 
+def cooldown_ok(state, key, cooldown_seconds):
+    with state_lock:
+        last = state.get(key)
+        now_ts = time.time()
+        if last and (now_ts - last) < cooldown_seconds:
+            return False
+        state[key] = now_ts
+        return True
+
+
 # ---------------------------------------------------------------------------
-# PRICE DATA
+# MARKET DATA (CoinMarketCap primary, CoinGecko fallback)
 # ---------------------------------------------------------------------------
 
-def fetch_top_coins(top_n=TOP_N_COINS, vs_currency=VS_CURRENCY):
-    """Fetch top N coins by market cap with 24h change data from CoinGecko."""
+def fetch_market_data_cmc():
+    url = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/listings/latest"
+    headers = {"X-CMC_PRO_API_KEY": CMC_API_KEY, "Accepts": "application/json"}
+    params = {"start": 1, "limit": TOP_N_COINS, "convert": VS_CURRENCY.upper()}
+    resp = requests.get(url, headers=headers, params=params, timeout=15)
+    resp.raise_for_status()
+    data = resp.json()["data"]
+
+    coins = []
+    for c in data:
+        quote = c["quote"][VS_CURRENCY.upper()]
+        coins.append({
+            "symbol": c["symbol"].lower(),
+            "name": c["name"],
+            "price": quote["price"],
+            "rank": c.get("cmc_rank"),
+            "pct_1h": quote.get("percent_change_1h"),
+            "pct_24h": quote.get("percent_change_24h"),
+            "pct_7d": quote.get("percent_change_7d"),
+            "volume_24h": quote.get("volume_24h"),
+        })
+    return coins
+
+
+def fetch_market_data_coingecko():
+    url = "https://api.coingecko.com/api/v3/coins/markets"
     params = {
-        "vs_currency": vs_currency,
+        "vs_currency": VS_CURRENCY,
         "order": "market_cap_desc",
-        "per_page": top_n,
+        "per_page": TOP_N_COINS,
         "page": 1,
-        "price_change_percentage": "24h",
+        "price_change_percentage": "1h,24h,7d",
         "sparkline": "false",
     }
-    resp = requests.get(COINGECKO_MARKETS_URL, params=params, timeout=15)
+    resp = requests.get(url, params=params, timeout=15)
     resp.raise_for_status()
-    return resp.json()
+    data = resp.json()
+
+    coins = []
+    for c in data:
+        coins.append({
+            "symbol": c["symbol"].lower(),
+            "name": c["name"],
+            "price": c["current_price"],
+            "rank": c.get("market_cap_rank"),
+            "pct_1h": c.get("price_change_percentage_1h_in_currency"),
+            "pct_24h": c.get("price_change_percentage_24h_in_currency"),
+            "pct_7d": c.get("price_change_percentage_7d_in_currency"),
+            "volume_24h": c.get("total_volume"),
+        })
+    return coins
+
+
+def fetch_market_data():
+    if CMC_API_KEY:
+        try:
+            return fetch_market_data_cmc()
+        except requests.RequestException as e:
+            log.warning(f"CoinMarketCap fetch failed ({e}), falling back to CoinGecko.")
+    try:
+        return fetch_market_data_coingecko()
+    except requests.RequestException as e:
+        log.error(f"CoinGecko fetch also failed: {e}")
+        return []
 
 
 # ---------------------------------------------------------------------------
@@ -137,12 +220,9 @@ def fetch_top_coins(top_n=TOP_N_COINS, vs_currency=VS_CURRENCY):
 # ---------------------------------------------------------------------------
 
 def fetch_recent_news():
-    """Pull recent headlines from configured RSS feeds. Returns list of (title, link, source)."""
     if feedparser is None:
-        log.warning("feedparser not installed; skipping news lookup. "
-                    "Install with: pip install feedparser --break-system-packages")
+        log.warning("feedparser not installed; skipping news lookup.")
         return []
-
     items = []
     for feed_url in NEWS_FEEDS:
         try:
@@ -159,14 +239,13 @@ def fetch_recent_news():
     return items
 
 
-def find_related_headlines(coin, news_items, max_items=3):
-    """Match news headlines mentioning the coin's name or symbol."""
-    name = coin["name"].lower()
-    symbol = coin["symbol"].lower()
+def find_related_headlines(name, symbol, news_items, max_items=3):
+    name_l = name.lower()
+    symbol_l = symbol.lower()
     matches = []
     for item in news_items:
         title_lower = item["title"].lower()
-        if name in title_lower or f" {symbol} " in f" {title_lower} ":
+        if name_l in title_lower or f" {symbol_l} " in f" {title_lower} ":
             matches.append(item)
         if len(matches) >= max_items:
             break
@@ -179,10 +258,8 @@ def find_related_headlines(coin, news_items, max_items=3):
 
 def send_telegram_message(text):
     if TELEGRAM_BOT_TOKEN.startswith("PUT_YOUR") or TELEGRAM_CHAT_ID.startswith("PUT_YOUR"):
-        log.error("Telegram credentials not configured. Set TELEGRAM_BOT_TOKEN and "
-                   "TELEGRAM_CHAT_ID (env vars or in the script). Printing alert instead:\n" + text)
+        log.error("Telegram credentials not configured. Printing alert instead:\n" + text)
         return
-
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
@@ -197,70 +274,234 @@ def send_telegram_message(text):
         log.error(f"Failed to send Telegram message: {e}")
 
 
-# ---------------------------------------------------------------------------
-# ALERT LOGIC
-# ---------------------------------------------------------------------------
+def fmt_price(p):
+    return f"${p:,.4f}" if p < 1 else f"${p:,.2f}"
 
-def format_alert(coin, news_matches):
-    change = coin["price_change_percentage_24h"]
-    direction = "🚀 UP" if change > 0 else "🔻 DOWN"
-    price = coin["current_price"]
-    symbol = coin["symbol"].upper()
-    name = coin["name"]
 
-    lines = [
-        f"*{direction} {abs(change):.2f}%* — {name} ({symbol})",
-        f"Price: ${price:,.4f}" if price < 1 else f"Price: ${price:,.2f}",
-        f"24h change: {change:+.2f}%",
-        f"Market cap rank: #{coin.get('market_cap_rank', '?')}",
-    ]
-
-    if news_matches:
+def send_alert(kind, name, symbol, detail_lines, news_items):
+    matches = find_related_headlines(name, symbol, news_items)
+    lines = [f"*{kind}* — {name} ({symbol.upper()})"] + detail_lines
+    if matches:
         lines.append("\n*Related news:*")
-        for item in news_matches:
-            lines.append(f"- [{item['title']}]({item['link']}) ({item['source']})")
-    else:
-        lines.append("\n_No matching recent headlines found._")
-
+        for m in matches:
+            lines.append(f"- [{m['title']}]({m['link']}) ({m['source']})")
     lines.append(f"\n_{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}_")
-    return "\n".join(lines)
+    message = "\n".join(lines)
+    log.info(f"ALERT [{kind}] {symbol.upper()}")
+    send_telegram_message(message)
 
 
-def check_and_alert(state):
-    try:
-        coins = fetch_top_coins()
-    except requests.RequestException as e:
-        log.error(f"Failed to fetch price data: {e}")
-        return state
+# ---------------------------------------------------------------------------
+# PERIODIC CHECK: 1h / 24h / 7d moves + volume spikes
+# ---------------------------------------------------------------------------
 
-    news_items = fetch_recent_news()
-    now_ts = time.time()
+volume_history = {}  # symbol -> deque of recent volume readings
+
+def check_periodic(state, news_items):
+    coins = fetch_market_data()
+    if not coins:
+        return coins
 
     for coin in coins:
-        symbol = coin["symbol"].upper()
-        change = coin.get("price_change_percentage_24h")
-        if change is None:
+        symbol = coin["symbol"]
+        if symbol in STABLECOIN_SYMBOLS:
             continue
+        name = coin["name"]
 
-        if abs(change) < MOVE_THRESHOLD_PERCENT:
-            continue
+        # --- price move checks across timeframes ---
+        for timeframe, threshold in THRESHOLDS.items():
+            change = coin.get(f"pct_{timeframe}")
+            if change is None or abs(change) < threshold:
+                continue
+            direction = "up" if change > 0 else "down"
+            key = f"{symbol}_{timeframe}_{direction}"
+            if not cooldown_ok(state, key, COOLDOWN_MINUTES * 60):
+                continue
+            arrow = "🚀 UP" if change > 0 else "🔻 DOWN"
+            send_alert(
+                f"{arrow} {abs(change):.2f}% ({timeframe})",
+                name, symbol,
+                [f"Price: {fmt_price(coin['price'])}",
+                 f"{timeframe} change: {change:+.2f}%",
+                 f"Market cap rank: #{coin.get('rank', '?')}"],
+                news_items,
+            )
+
+        # --- volume spike check ---
+        vol = coin.get("volume_24h")
+        if vol is not None:
+            hist = volume_history.setdefault(symbol, deque(maxlen=VOLUME_HISTORY_SAMPLES))
+            if len(hist) >= 3:  # need a little history before judging a "spike"
+                avg = sum(hist) / len(hist)
+                if avg > 0:
+                    vol_change = (vol - avg) / avg * 100
+                    if vol_change >= VOLUME_SPIKE_THRESHOLD_PERCENT:
+                        key = f"{symbol}_volume"
+                        if cooldown_ok(state, key, COOLDOWN_MINUTES * 60):
+                            send_alert(
+                                f"📊 VOLUME SPIKE +{vol_change:.0f}%",
+                                name, symbol,
+                                [f"Price: {fmt_price(coin['price'])}",
+                                 f"24h volume: ${vol:,.0f} (avg: ${avg:,.0f})",
+                                 f"Market cap rank: #{coin.get('rank', '?')}"],
+                                news_items,
+                            )
+            hist.append(vol)
+
+    return coins
+
+
+# ---------------------------------------------------------------------------
+# FAST-MOVE LAYER: live Binance WebSocket
+# ---------------------------------------------------------------------------
+
+class BinanceWatcher:
+    """Maintains a live WebSocket connection to Binance for the current set
+    of watched coins, and raises fast-move alerts within a short rolling
+    window, independent of the slower periodic poll."""
+
+    def __init__(self, state, news_items_getter):
+        self.state = state
+        self.news_items_getter = news_items_getter
+        self.price_history = {}   # binance_symbol -> deque[(ts, price)]
+        self.symbol_meta = {}     # binance_symbol -> {"symbol":..., "name":...}
+        self._valid_pairs = None
+        self._ws = None
+        self._ws_thread = None
+        self._lock = threading.Lock()
+        self._stop = False
+
+    def _fetch_valid_pairs(self):
+        try:
+            resp = requests.get(BINANCE_EXCHANGE_INFO_URL, timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+            return {s["symbol"].lower() for s in data["symbols"] if s["status"] == "TRADING"}
+        except requests.RequestException as e:
+            log.warning(f"Could not fetch Binance exchange info: {e}")
+            return set()
+
+    def update_watchlist(self, coins):
+        """Call whenever the top-N coin list changes. Rebuilds the socket
+        subscription if the set of tradable pairs changed."""
+        if self._valid_pairs is None:
+            self._valid_pairs = self._fetch_valid_pairs()
+
+        new_meta = {}
+        for c in coins:
+            symbol = c["symbol"]
+            if symbol in STABLECOIN_SYMBOLS:
+                continue
+            pair = f"{symbol}usdt"
+            if pair in self._valid_pairs:
+                new_meta[pair] = {"symbol": symbol, "name": c["name"]}
+
+        with self._lock:
+            changed = set(new_meta.keys()) != set(self.symbol_meta.keys())
+            self.symbol_meta = new_meta
+
+        if changed:
+            log.info(f"Fast-move watchlist updated: {sorted(m['symbol'].upper() for m in new_meta.values())}")
+            self._restart_socket()
+
+    def _restart_socket(self):
+        if self._ws is not None:
+            try:
+                self._ws.close()
+            except Exception:
+                pass
+        if not self.symbol_meta:
+            return
+        if self._ws_thread is None or not self._ws_thread.is_alive():
+            self._ws_thread = threading.Thread(target=self._run_forever, daemon=True)
+            self._ws_thread.start()
+
+    def _run_forever(self):
+        if websocket is None:
+            log.warning("websocket-client not installed; skipping fast-move layer. "
+                        "Install with: pip install websocket-client --break-system-packages")
+            return
+        while not self._stop:
+            with self._lock:
+                pairs = list(self.symbol_meta.keys())
+            if not pairs:
+                time.sleep(5)
+                continue
+            streams = "/".join(f"{p}@miniTicker" for p in pairs)
+            url = BINANCE_WS_BASE + streams
+            try:
+                self._ws = websocket.WebSocketApp(
+                    url,
+                    on_message=self._on_message,
+                    on_error=lambda ws, err: log.warning(f"Binance WS error: {err}"),
+                )
+                self._ws.run_forever(ping_interval=30, ping_timeout=10)
+            except Exception as e:
+                log.warning(f"Binance WS connection failed: {e}")
+            if not self._stop:
+                time.sleep(5)  # brief backoff before reconnecting
+
+    def _on_message(self, ws, message):
+        try:
+            payload = json.loads(message)
+            data = payload.get("data", {})
+            pair = data.get("s", "").lower()
+            price = float(data.get("c", 0))
+        except (ValueError, TypeError, json.JSONDecodeError):
+            return
+        if not pair or price <= 0:
+            return
+
+        with self._lock:
+            meta = self.symbol_meta.get(pair)
+        if meta is None:
+            return
+
+        now = time.time()
+        hist = self.price_history.setdefault(pair, deque(maxlen=1000))
+        hist.append((now, price))
+
+        # prune old entries beyond 2x the window to bound memory
+        cutoff = now - (FAST_MOVE_WINDOW_SECONDS * 2)
+        while hist and hist[0][0] < cutoff:
+            hist.popleft()
+
+        # find the oldest sample within the window
+        window_start = now - FAST_MOVE_WINDOW_SECONDS
+        old_price = None
+        for ts, p in hist:
+            if ts >= window_start:
+                old_price = p
+                break
+        if old_price is None or old_price <= 0:
+            return
+
+        change = (price - old_price) / old_price * 100
+        if abs(change) < FAST_MOVE_THRESHOLD_PERCENT:
+            return
 
         direction = "up" if change > 0 else "down"
-        key = f"{symbol}_{direction}"
-        last_alert = state.get(key)
+        key = f"{meta['symbol']}_fast_{direction}"
+        if not cooldown_ok(self.state, key, FAST_MOVE_COOLDOWN_SECONDS):
+            return
 
-        # Cooldown: skip if we already alerted on this coin/direction recently
-        if last_alert and (now_ts - last_alert["ts"]) < COOLDOWN_MINUTES * 60:
-            continue
+        arrow = "⚡🚀 FAST MOVE UP" if change > 0 else "⚡🔻 FAST MOVE DOWN"
+        news_items = self.news_items_getter()
+        send_alert(
+            f"{arrow} {abs(change):.2f}% (last {FAST_MOVE_WINDOW_SECONDS // 60} min)",
+            meta["name"], meta["symbol"],
+            [f"Price: {fmt_price(price)}",
+             f"Move: {change:+.2f}% in ~{FAST_MOVE_WINDOW_SECONDS // 60} min"],
+            news_items,
+        )
 
-        news_matches = find_related_headlines(coin, news_items)
-        message = format_alert(coin, news_matches)
-        log.info(f"ALERT: {symbol} moved {change:+.2f}% — sending Telegram message.")
-        send_telegram_message(message)
-
-        state[key] = {"ts": now_ts, "change": change}
-
-    return state
+    def stop(self):
+        self._stop = True
+        if self._ws is not None:
+            try:
+                self._ws.close()
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -268,13 +509,29 @@ def check_and_alert(state):
 # ---------------------------------------------------------------------------
 
 def main():
-    log.info(f"Starting crypto alert agent — watching top {TOP_N_COINS} coins, "
-              f"threshold {MOVE_THRESHOLD_PERCENT}%, checking every {CHECK_INTERVAL_MINUTES} min.")
+    source = "CoinMarketCap" if CMC_API_KEY else "CoinGecko"
+    log.info(f"Starting crypto alert agent v2 — top {TOP_N_COINS} coins via {source}, "
+              f"polling every {CHECK_INTERVAL_MINUTES} min, fast-move window "
+              f"{FAST_MOVE_WINDOW_SECONDS}s @ {FAST_MOVE_THRESHOLD_PERCENT}%.")
+
     state = load_state()
+    cached_news = {"items": [], "ts": 0}
+
+    def get_news():
+        # refresh news at most once every 10 minutes, shared across layers
+        if time.time() - cached_news["ts"] > 600:
+            cached_news["items"] = fetch_recent_news()
+            cached_news["ts"] = time.time()
+        return cached_news["items"]
+
+    watcher = BinanceWatcher(state, get_news)
 
     while True:
         try:
-            state = check_and_alert(state)
+            news_items = get_news()
+            coins = check_periodic(state, news_items)
+            if coins:
+                watcher.update_watchlist(coins)
             save_state(state)
         except Exception as e:
             log.exception(f"Unexpected error in check cycle: {e}")
