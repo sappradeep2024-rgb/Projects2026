@@ -298,7 +298,7 @@ def analyze_coin(coin, candles_1h, candles_4h=None, candles_1d=None, daily_close
     # --- multi-timeframe confluence ---
     directions = {"1h": get_trend_direction(closes_1h)}
     if candles_4h:
-        directions["4h"] = get_trend_direction([c[4] for c in candles_4h])
+        directions["6h"] = get_trend_direction([c[4] for c in candles_4h])
     if candles_1d:
         directions["1d"] = get_trend_direction([c[4] for c in candles_1d])
 
@@ -374,7 +374,7 @@ def build_report(results):
         f"🗓 {now_str}\n"
         f"🔎 Scanned: *{len(results_sorted)}* coins  |  Showing top *{len(top)}*\n"
         f"🟢 Bullish: {bullish}   ⚪ Neutral: {neutral}   🔴 Bearish: {bearish}\n"
-        "⏱ Timeframe: 1h primary + 4h/1d confluence\n\n"
+        "⏱ Timeframe: 1h primary + 6h/1d confluence\n\n"
         "⚠️ _Informational only — not investment advice. Indicators are lagging "
         "heuristics, not signals to act on. Day trading crypto is high-risk. "
         "Do your own research._\n"
@@ -426,13 +426,13 @@ def main():
         log.error(f"Failed to build universe: {e}")
         return
 
-    log.info(f"Analyzing {len(universe)} coins tradable on Coinbase (1h/4h/1d confluence + patterns)...")
+    log.info(f"Analyzing {len(universe)} coins tradable on Coinbase (1h/6h/1d confluence + patterns)...")
     results = []
     for coin in universe:
         try:
             candles_1h = fetch_candles(coin["product_id"], 3600)
             time.sleep(REQUEST_DELAY_SECONDS)
-            candles_4h = fetch_candles(coin["product_id"], 14400)
+            candles_4h = fetch_candles(coin["product_id"], 21600)  # Coinbase has no 4h; 6h is the nearest valid granularity
             time.sleep(REQUEST_DELAY_SECONDS)
             candles_1d = fetch_candles(coin["product_id"], 86400)
             time.sleep(REQUEST_DELAY_SECONDS)
