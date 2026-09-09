@@ -37,6 +37,8 @@ from datetime import datetime, timezone
 
 import requests
 
+from patterns import detect_all_patterns
+
 # ---------------------------------------------------------------------------
 # CONFIGURATION
 # ---------------------------------------------------------------------------
@@ -107,15 +109,17 @@ def fetch_universe():
     return universe
 
 
-def fetch_candles(product_id):
+def fetch_candles(product_id, granularity=None, limit=None):
+    granularity = granularity or CANDLE_GRANULARITY_SECONDS
+    limit = limit if limit is not None else CANDLE_LOOKBACK
     url = COINBASE_CANDLES_URL.format(product_id=product_id)
-    params = {"granularity": CANDLE_GRANULARITY_SECONDS}
+    params = {"granularity": granularity}
     resp = requests.get(url, params=params, headers=HEADERS, timeout=15)
     resp.raise_for_status()
     data = resp.json()  # [time, low, high, open, close, volume], newest first
     data.sort(key=lambda c: c[0])  # chronological order
-    if len(data) > CANDLE_LOOKBACK:
-        data = data[-CANDLE_LOOKBACK:]
+    if limit and len(data) > limit:
+        data = data[-limit:]
     return data
 
 
@@ -183,24 +187,25 @@ def compute_bollinger(closes, period=20, num_std=2):
 
 
 # ---------------------------------------------------------------------------
-# SCORING
+# SCORING (pure functions - reused identically by the live screener and the
+# backtester, so backtest results actually reflect what the live tool does)
 # ---------------------------------------------------------------------------
 
-def analyze_coin(coin, candles):
-    if len(candles) < 30:
-        return None  # not enough data for reliable indicators
+def compute_signals(closes, volumes):
+    """Given a chronological list of closes and volumes, return the indicator
+    values, a list of human-readable signal strings, and a composite score.
+    Returns None if there isn't enough history yet."""
+    if len(closes) < 30:
+        return None
 
-    closes = [c[4] for c in candles]
-    volumes = [c[5] for c in candles]
     price = closes[-1]
-
     rsi_val = compute_rsi(closes)
     macd_line, macd_signal, macd_hist = compute_macd(closes)
     sma20 = sma(closes, 20)
     sma50 = sma(closes, 50) if len(closes) >= 50 else None
     boll_lower, boll_mid, boll_upper = compute_bollinger(closes)
-    avg_volume = sum(volumes[-20:]) / min(20, len(volumes))
-    volume_ratio = (volumes[-1] / avg_volume) if avg_volume > 0 else None
+    avg_volume = sum(volumes[-20:]) / min(20, len(volumes)) if volumes else None
+    volume_ratio = (volumes[-1] / avg_volume) if avg_volume else None
 
     score = 0
     signals = []
@@ -245,9 +250,6 @@ def analyze_coin(coin, candles):
         score += 1
 
     return {
-        "symbol": coin["symbol"],
-        "name": coin["name"],
-        "rank": coin["market_cap_rank"],
         "price": price,
         "rsi": rsi_val,
         "macd_hist": macd_hist,
@@ -255,6 +257,79 @@ def analyze_coin(coin, candles):
         "score": score,
         "signals": signals,
     }
+
+
+def get_trend_direction(closes):
+    """Simplified up/down/neutral vote used for multi-timeframe confluence."""
+    if len(closes) < 30:
+        return "unknown"
+    macd_line, macd_signal, _ = compute_macd(closes)
+    sma20 = sma(closes, 20)
+    sma50 = sma(closes, 50) if len(closes) >= 50 else None
+    price = closes[-1]
+
+    bullish_votes = bearish_votes = 0
+    if macd_line is not None:
+        if macd_line > macd_signal:
+            bullish_votes += 1
+        else:
+            bearish_votes += 1
+    if sma20 and sma50:
+        if price > sma20 > sma50:
+            bullish_votes += 1
+        elif price < sma20 < sma50:
+            bearish_votes += 1
+
+    if bullish_votes > bearish_votes:
+        return "bullish"
+    elif bearish_votes > bullish_votes:
+        return "bearish"
+    return "neutral"
+
+
+def analyze_coin(coin, candles_1h, candles_4h=None, candles_1d=None, daily_closes_full=None):
+    closes_1h = [c[4] for c in candles_1h]
+    volumes_1h = [c[5] for c in candles_1h]
+
+    base = compute_signals(closes_1h, volumes_1h)
+    if base is None:
+        return None
+
+    # --- multi-timeframe confluence ---
+    directions = {"1h": get_trend_direction(closes_1h)}
+    if candles_4h:
+        directions["4h"] = get_trend_direction([c[4] for c in candles_4h])
+    if candles_1d:
+        directions["1d"] = get_trend_direction([c[4] for c in candles_1d])
+
+    bullish_count = sum(1 for d in directions.values() if d == "bullish")
+    bearish_count = sum(1 for d in directions.values() if d == "bearish")
+    confluence_score = bullish_count - bearish_count
+
+    tf_summary = "/".join(f"{tf}:{d[:4]}" for tf, d in directions.items())
+    if confluence_score >= 2:
+        base["signals"].append(f"✅ Multi-timeframe confluence bullish ({tf_summary})")
+    elif confluence_score <= -2:
+        base["signals"].append(f"⚠️ Multi-timeframe confluence bearish ({tf_summary})")
+    else:
+        base["signals"].append(f"Mixed across timeframes ({tf_summary})")
+
+    base["score"] += confluence_score
+
+    # --- pattern detection (candlestick + chart + crossover/divergence) ---
+    patterns = detect_all_patterns(candles_1h, daily_closes_full)
+    base["patterns"] = patterns
+    for name, direction in patterns:
+        base["signals"].append(f"📐 {name} ({direction})")
+        if direction == "bullish":
+            base["score"] += 1
+        elif direction == "bearish":
+            base["score"] -= 1
+
+    base["symbol"] = coin["symbol"]
+    base["name"] = coin["name"]
+    base["rank"] = coin["market_cap_rank"]
+    return base
 
 
 # ---------------------------------------------------------------------------
@@ -299,7 +374,7 @@ def build_report(results):
         f"🗓 {now_str}\n"
         f"🔎 Scanned: *{len(results_sorted)}* coins  |  Showing top *{len(top)}*\n"
         f"🟢 Bullish: {bullish}   ⚪ Neutral: {neutral}   🔴 Bearish: {bearish}\n"
-        "⏱ Timeframe: 1h candles\n\n"
+        "⏱ Timeframe: 1h primary + 4h/1d confluence\n\n"
         "⚠️ _Informational only — not investment advice. Indicators are lagging "
         "heuristics, not signals to act on. Day trading crypto is high-risk. "
         "Do your own research._\n"
@@ -317,6 +392,23 @@ def build_report(results):
         )
 
     lines.append("━━━━━━━━━━━━━━━━━━━━")
+
+    # --- pattern comparison summary across the whole universe ---
+    pattern_map = {}  # pattern_name -> list of (symbol, direction)
+    for r in results:
+        for name, direction in r.get("patterns", []):
+            pattern_map.setdefault(name, []).append((r["symbol"].upper(), direction))
+
+    if pattern_map:
+        lines.append("📐 *PATTERNS DETECTED TODAY (all scanned coins)*")
+        for name in sorted(pattern_map.keys()):
+            entries = pattern_map[name]
+            direction = entries[0][1]
+            icon = "🟢" if direction == "bullish" else ("🔴" if direction == "bearish" else "⚪")
+            coin_list = ", ".join(sym for sym, _ in entries)
+            lines.append(f"{icon} *{name}*: {coin_list}")
+        lines.append("━━━━━━━━━━━━━━━━━━━━")
+
     return "\n\n".join(lines)
 
 
@@ -334,17 +426,27 @@ def main():
         log.error(f"Failed to build universe: {e}")
         return
 
-    log.info(f"Analyzing {len(universe)} coins tradable on Coinbase...")
+    log.info(f"Analyzing {len(universe)} coins tradable on Coinbase (1h/4h/1d confluence + patterns)...")
     results = []
     for coin in universe:
         try:
-            candles = fetch_candles(coin["product_id"])
-            analysis = analyze_coin(coin, candles)
+            candles_1h = fetch_candles(coin["product_id"], 3600)
+            time.sleep(REQUEST_DELAY_SECONDS)
+            candles_4h = fetch_candles(coin["product_id"], 14400)
+            time.sleep(REQUEST_DELAY_SECONDS)
+            candles_1d = fetch_candles(coin["product_id"], 86400)
+            time.sleep(REQUEST_DELAY_SECONDS)
+            # extra daily history (up to Coinbase's 300-candle cap) needed for
+            # the golden/death cross check, which requires 200+ days of data
+            daily_full = fetch_candles(coin["product_id"], 86400, limit=300)
+            daily_closes_full = [c[4] for c in daily_full]
+            time.sleep(REQUEST_DELAY_SECONDS)
+
+            analysis = analyze_coin(coin, candles_1h, candles_4h, candles_1d, daily_closes_full)
             if analysis:
                 results.append(analysis)
         except requests.RequestException as e:
             log.warning(f"Skipping {coin['symbol'].upper()}: {e}")
-        time.sleep(REQUEST_DELAY_SECONDS)
 
     if not results:
         log.warning("No results to report.")
