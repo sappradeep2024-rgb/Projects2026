@@ -282,12 +282,23 @@ def fmt_price(p):
 
 def send_alert(kind, name, symbol, detail_lines, news_items):
     matches = find_related_headlines(name, symbol, news_items)
-    lines = [f"*{kind}* — {name} ({symbol.upper()})"] + detail_lines
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    lines = [
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"🚨 *CRYPTO ALERT* — {now_str}",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"*{kind}*",
+        f"*{name} ({symbol.upper()})*",
+        "",
+    ] + detail_lines
+
     if matches:
         lines.append("\n*Related news:*")
         for m in matches:
             lines.append(f"- [{m['title']}]({m['link']}) ({m['source']})")
-    lines.append(f"\n_{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}_")
+
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
     message = "\n".join(lines)
     log.info(f"ALERT [{kind}] {symbol.upper()}")
     send_telegram_message(message)
