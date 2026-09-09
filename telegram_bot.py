@@ -223,7 +223,7 @@ def handle_ticker(chat_id, symbol):
     try:
         candles_1h = fetch_candles(product_id, 3600)
         time.sleep(0.3)
-        candles_4h = fetch_candles(product_id, 14400)
+        candles_4h = fetch_candles(product_id, 21600)  # Coinbase has no 4h; 6h is the nearest valid granularity
         time.sleep(0.3)
         candles_1d = fetch_candles(product_id, 86400)
         time.sleep(0.3)
